@@ -95,6 +95,42 @@ def merge_lines(lines):
         yield repo, filename, line_number, line_kind, line
 
 
+def handle_hound_error(response):
+    if 'Error' in response:
+        sys.exit("Hound server returned an error: %s" % response['Error'])
+
+
+def call_api(endpoint, payload=None):
+    """Call API on Hound server and undecode JSON response.
+
+    If any connection error occurs, we exit the program with an error
+    message.
+    """
+    try:
+        response = requests.get(
+            endpoint,
+            params=payload,
+            timeout=DEFAULT_TIMEOUT,
+        )
+    except (requests.ConnectionError, requests.HTTPError) as exc:
+        # exc.args[0] is the original exception that `requests`
+        # wraps. We could probably make the output better for some
+        # cases but I am not keen to guess how each exception
+        # looks like.
+        sys.exit("Could not connect to Hound server: %s" % exc.args[0])
+    except requests.Timeout:
+        sys.exit("Could not connect to Hound server: timeout.")
+
+    try:
+        json = response.json()
+    except ValueError:
+        sys.exit(
+            "Server did not return a valid JSON response. "
+            "Got this instead:\n%s" % response.text
+        )
+    return json
+
+
 class Client(object):
 
     def __init__(self,
@@ -135,6 +171,10 @@ class Client(object):
         self.ignore_case = ignore_case
         self.show_line_number = show_line_number
 
+        # Internal data.
+        self._matching_repos = None
+        self._left_to_retrieve = None
+
     def get_repo_list(self, repos, exclude_repos):
         """Return a comma-separated list of repositories to look in.
 
@@ -143,7 +183,8 @@ class Client(object):
         if not exclude_repos:
             return repos
         if repos == '*':
-            response = self._call_api(self.endpoint_list_repos)
+            response = call_api(self.endpoint_list_repos)
+            handle_hound_error(response)
             repos = set(response.keys())
         else:
             repos = set(r.strip() for r in repos.split(','))
@@ -152,66 +193,70 @@ class Client(object):
         return ','.join(repos)
 
     def run(self):
-        results = self.get_search_results()
-        lines = self.get_lines(results)
-        self.print_lines(lines)
+        # FIXME: we could add a '--many' option to avoid the first "no
+        # range" API call if the user thinks it is going to fail
+        # because there are too many results.
+        self.collect_search_results()
+        self.show_results()
 
-    def get_search_results(self):
+    def collect_search_results(self, rng=''):
         """Call Hound API to perform search."""
-        payload = {
+        base_payload = {
             'repos': self.repos,
-            'rng': '',  # range. Empty, we want all results.,
+            'rng': rng,  
             'files': self.path_pattern,
             'i': 'true' if self.ignore_case else '',
             'q': self.pattern,
         }
-        response = self._call_api(self.endpoint_search, payload)
-        return response['Results']
+        response = call_api(self.endpoint_search, base_payload)
 
-    def _call_api(self, endpoint, payload=None):
-        """Call API on Hound server and undecode JSON response.
+        if 'search exceeds limit' in response.get('Error', ''):
+            # Too many search results with this (possibly empty) range.
+            # Try a smaller range.
+            if not rng:
+                rng = '0:50'
+            else:
+                start, end = rng.split(':')
+                end = (end - start) // 2
+                if end == 0:
+                    # I *think* that it would happen if a *single*
+                    # file had more matches than the maximum number
+                    # (5000) of matches allowed in a single request.
+                    # This is defensive programming: I did not try to
+                    # reproduce this behaviour.
+                    sys.exit("There are too many results to retrieve in the smallest possible range.")
+                rng = '%d:%d' % (start, end)
+            return self.collect_search_results(rng)
 
-        If any error occurs, we exit the program with an error
-        message.
-        """
-        try:
-            response = requests.get(
-                endpoint,
-                params=payload,
-                timeout=DEFAULT_TIMEOUT,
-            )
-        except (requests.ConnectionError, requests.HTTPError) as exc:
-            # exc.args[0] is the original exception that `requests`
-            # wraps. We could probably make the output better for some
-            # cases but I am not keen to guess how each exception
-            # looks like.
-            sys.exit("Could not connect to Hound server: %s" % exc.args[0])
-        except requests.Timeout:
-            sys.exit("Could not connect to Hound server: timeout.")
+        handle_hound_error(response)
 
-        try:
-            json = response.json()
-        except ValueError:
-            sys.exit(
-                "Server did not return a valid JSON response. "
-                "Got this instead:\n%s" % response.text
-            )
+        results = response['Results']
+        for repo, result in results.items():  # FIXME: use iteritems
+            self.lines.extend(self.get_lines(repo, result))
 
-        if 'Error' in json:
-            sys.exit("Hound server returned an error: %s" % json['Error'])
-        return json
+            if initial:
+                self._matching_repos = {}
+                self._left_to_retrieve = {}
+                for repo, result in results.items():
+                    self._matching_repos[repo] = result['FilesWithMatch']
+                    self._left_to_retrieve[repo] = result['FilesWithMatch']
 
-    def get_lines(self, results):
-        for repo, result in results.items():
-            for match in result['Matches']:
-                lines = []
-                filename = match['Filename']
-                for file_match in match['Matches']:
-                    lines.extend(self.get_lines_for_repo(repo, filename, file_match))
-                if self.before_context or self.after_context or self.context:
-                    lines = merge_lines(lines)
-                for line in lines:
-                    yield line
+            self._left_to_retrieve[repo] -= len(result['Matches'])
+            if self._left_to_retrieve:
+            # FIXME: check whether we have retrieved all results for this repo.
+
+
+
+    def get_lines(self, repo, result):
+        for match in result['Matches']:
+            lines = []
+            filename = match['Filename']
+            for file_match in match['Matches']:
+                lines.extend(self.get_lines_for_repo(repo, filename, file_match))
+            if self.before_context or self.after_context or self.context:
+                lines = merge_lines(lines)
+            for line in lines:
+                yield line
 
     def get_lines_for_repo(self, repo, filename, match):
         for line_number, line_kind, line in get_lines_with_context(
@@ -224,9 +269,9 @@ class Client(object):
                 self.context):
             yield (repo, filename, line_number, line_kind, line)
 
-    def print_lines(self, lines):
+    def show_results(self):
         encoding = locale.getdefaultlocale()[1] or 'utf-8'
-        for repo, filename, line_number, line_kind, line in lines:
+        for repo, filename, line_number, line_kind, line in self.lines:
             if self.show_line_number:
                 fmt = "{repo}:{filename}{delim}{line_number}{delim}{line}"
             else:
